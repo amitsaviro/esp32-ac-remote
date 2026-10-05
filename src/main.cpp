@@ -8,6 +8,7 @@
 //                  {"power":"on"|"off"|"toggle", "temp":24,
 //                   "mode":"cool"|"heat"|"dry"|"fan"|"auto",
 //                   "fan":"auto"|"low"|"medium"|"high"}
+//                  or {"assume":"on"|"off"} to fix our power state without sending
 //   <base>/state   ESP32 -> phone  JSON with the full current state (retained)
 //   <base>/status  "online" / "offline" (retained, offline set by the broker
 //                  automatically if the ESP32 disappears)
@@ -243,6 +244,16 @@ void handleSetCommand(const char *json) {
     return;
   }
 
+  // {"assume":"on"|"off"} corrects our idea of the power state without sending
+  // anything, for when the AC was switched with the original remote out of
+  // the receiver's sight.
+  if (doc["assume"].is<const char *>()) {
+    acIsOn = strcmp(doc["assume"], "on") == 0;
+    Serial.printf(">> Assuming the AC is %s\n", acIsOn ? "ON" : "OFF");
+    publishState("app");
+    return;
+  }
+
   bool wantPowerChange = false;
   if (doc["power"].is<const char *>()) {
     const char *p = doc["power"];
@@ -270,9 +281,11 @@ void handleSetCommand(const char *json) {
 
   if (wantPowerChange) {
     togglePower();  // carries the new temp/mode/fan along with it
-  } else if (command >= 0) {
-    Serial.println(">> Settings changed from app");
-    sendToAc(command);
+  } else {
+    // Send even if nothing changed: re-sending the same settings is harmless,
+    // the AC beeps as feedback, and it fixes things if it missed a command.
+    Serial.println(">> Settings from app");
+    sendToAc(command >= 0 ? command : kWhirlpoolAcCommandTemp);
   }
   // Publish even when nothing changed, so the app always gets a reply.
   publishState("app");

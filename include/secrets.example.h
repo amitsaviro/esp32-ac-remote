@@ -5,8 +5,8 @@
 #define WIFI_SSID     "your-network"
 #define WIFI_PASSWORD "your-password"
 
-// MQTT broker (HiveMQ Cloud). Host looks like xxxxxxxx.s1.eu.hivemq.cloud
-#define MQTT_HOST     "your-cluster.s1.eu.hivemq.cloud"
+// MQTT broker (EMQX Cloud Serverless). Host looks like xxxxxxxx.ala.eu-central-1.emqxsl.com
+#define MQTT_HOST     "your-cluster.ala.eu-central-1.emqxsl.com"
 #define MQTT_PORT     8883
 #define MQTT_USER     "esp32-ac"
 #define MQTT_PASSWORD "your-mqtt-password"
