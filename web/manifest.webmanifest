@@ -1,0 +1,16 @@
+{
+  "name": "המזגן",
+  "short_name": "המזגן",
+  "description": "שלט למזגן שעובד מכל מקום, דרך ESP32 ו-MQTT",
+  "lang": "he",
+  "dir": "rtl",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f4f6fa",
+  "theme_color": "#2f7cf6",
+  "icons": [
+    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

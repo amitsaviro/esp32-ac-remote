@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>המזגן</title>
+<meta name="description" content="שלט למזגן שעובד מכל מקום, דרך ESP32 ו-MQTT">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="המזגן">
+<meta name="theme-color" content="#f4f6fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1217" media="(prefers-color-scheme: dark)">
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --text: #141821;
+    --muted: #6b7280;
+    --line: #e3e7ee;
+    --accent: #2f7cf6;
+    --accent-soft: #e6effe;
+    --on: #16a34a;
+    --on-soft: #dcfce7;
+    --warn: #d97706;
+    --bad: #dc2626;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 4px 16px rgba(16, 24, 40, .06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1217;
+      --card: #181c23;
+      --text: #eef1f6;
+      --muted: #8b93a1;
+      --line: #262c36;
+      --accent: #5b9bff;
+      --accent-soft: #1b2a44;
+      --on: #34d399;
+      --on-soft: #10372a;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    min-height: 100vh;
+    padding: calc(env(safe-area-inset-top) + 16px) 16px calc(env(safe-area-inset-bottom) + 24px);
+  }
+  main { max-width: 440px; margin: 0 auto; display: grid; gap: 14px; }
+  button { font: inherit; color: inherit; border: 0; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 26px; margin: 0; letter-spacing: -.01em; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; padding: 6px 10px; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--line); color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.ok .dot { background: var(--on); }
+  .pill.warn .dot { background: var(--warn); }
+  .pill.bad .dot { background: var(--bad); }
+  .icon-btn {
+    width: 40px; height: 40px; border-radius: 12px;
+    background: var(--card); border: 1px solid var(--line);
+    display: grid; place-items: center;
+  }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 20px; padding: 18px; box-shadow: var(--shadow);
+  }
+  .hero { display: grid; justify-items: center; gap: 14px; padding: 26px 18px 22px; }
+  .state-label { font-size: 15px; color: var(--muted); }
+  .state-label strong { color: var(--text); }
+  .temp-row { display: flex; align-items: center; justify-content: center; gap: 22px; width: 100%; }
+  .temp {
+    font-size: 76px; font-weight: 300; line-height: 1;
+    font-variant-numeric: tabular-nums; min-width: 2.6ch; text-align: center;
+  }
+  .temp small { font-size: 30px; vertical-align: top; margin-inline-start: 2px; }
+  .round {
+    width: 56px; height: 56px; border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent);
+    font-size: 28px; line-height: 1;
+  }
+  .power {
+    width: 100%; padding: 16px; border-radius: 16px;
+    font-size: 18px; font-weight: 600;
+    background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+  }
+  .power.is-on { background: var(--on-soft); color: var(--on); }
+  .hero.off .temp, .hero.off .round { opacity: .45; }
+
+  .section-title { font-size: 13px; color: var(--muted); margin: 0 4px 8px; }
+  .seg { display: grid; gap: 8px; }
+  .seg.modes { grid-template-columns: repeat(5, 1fr); }
+  .seg.fans { grid-template-columns: repeat(4, 1fr); }
+  .seg button {
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px 2px; font-size: 13px;
+    display: grid; justify-items: center; gap: 4px;
+  }
+  .seg button .emoji { font-size: 20px; }
+  .seg button[aria-pressed="true"] {
+    background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600;
+  }
+
+  .meta { font-size: 13px; color: var(--muted); text-align: center; }
+
+  .toast {
+    position: fixed; inset-inline: 16px; bottom: calc(env(safe-area-inset-bottom) + 16px);
+    max-width: 440px; margin: 0 auto; padding: 12px 14px; border-radius: 12px;
+    background: var(--text); color: var(--bg); font-size: 14px; text-align: center;
+    opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: none; }
+
+  dialog {
+    border: 1px solid var(--line); border-radius: 20px; padding: 0;
+    background: var(--card); color: var(--text);
+    width: min(440px, calc(100vw - 32px));
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .4); }
+  .dialog-body { padding: 20px; display: grid; gap: 14px; }
+  .dialog-body h2 { margin: 0; font-size: 20px; }
+  label { display: grid; gap: 6px; font-size: 14px; color: var(--muted); }
+  input {
+    font: inherit; font-size: 16px; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; direction: ltr; text-align: left;
+  }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .btn {
+    padding: 12px; border-radius: 12px; font-weight: 600;
+    background: var(--bg); border: 1px solid var(--line);
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .hint { font-size: 13px; color: var(--muted); margin: 0; line-height: 1.5; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; width: 100%; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>המזגן ❄️</h1>
+    <div style="display:flex; gap:8px; align-items:center">
+      <span class="pill" id="status"><span class="dot"></span><span id="status-text">מתחבר…</span></span>
+      <button class="icon-btn" id="open-settings" aria-label="הגדרות">⚙️</button>
+    </div>
+  </header>
+
+  <section class="card hero off" id="hero">
+    <div class="state-label" id="state-label">ממתין לנתונים מהלוח…</div>
+    <div class="temp-row">
+      <button class="round" id="temp-up" aria-label="העלה טמפרטורה">+</button>
+      <div class="temp" id="temp">--<small>°</small></div>
+      <button class="round" id="temp-down" aria-label="הורד טמפרטורה">−</button>
+    </div>
+    <button class="power" id="power">⏻ <span id="power-text">הדלק</span></button>
+  </section>
+
+  <section class="card">
+    <p class="section-title">מצב</p>
+    <div class="seg modes" id="modes">
+      <button data-mode="cool"><span class="emoji">❄️</span>קירור</button>
+      <button data-mode="heat"><span class="emoji">☀️</span>חימום</button>
+      <button data-mode="dry"><span class="emoji">💧</span>ייבוש</button>
+      <button data-mode="fan"><span class="emoji">🌀</span>מאוורר</button>
+      <button data-mode="auto"><span class="emoji">✨</span>אוטו׳</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <p class="section-title">מאוורר</p>
+    <div class="seg fans" id="fans">
+      <button data-fan="auto">אוטו׳</button>
+      <button data-fan="low">נמוך</button>
+      <button data-fan="medium">בינוני</button>
+      <button data-fan="high">גבוה</button>
+    </div>
+  </section>
+
+  <p class="meta" id="meta"></p>
+</main>
+
+<div class="toast" id="toast" role="status"></div>
+
+<dialog id="settings">
+  <form class="dialog-body" method="dialog" id="settings-form">
+    <h2>הגדרות</h2>
+    <label>כתובת השרת
+      <input id="host" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+    </label>
+    <label>שם משתמש
+      <input id="user" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+    </label>
+    <label>סיסמה
+      <input id="pass" type="password" autocomplete="current-password" required>
+    </label>
+    <p class="hint">הפרטים נשמרים רק במכשיר הזה.</p>
+    <div class="row">
+      <button class="btn" value="cancel" formnovalidate>ביטול</button>
+      <button class="btn primary" value="save" id="save">שמור והתחבר</button>
+    </div>
+    <hr>
+    <p class="hint">המזגן הופעל או כובה בשלט המקורי כשהלוח לא ראה? תקן את המצב בלי לשלוח פקודה:</p>
+    <div class="row">
+      <button class="btn" type="button" data-assume="on">המזגן דלוק</button>
+      <button class="btn" type="button" data-assume="off">המזגן כבוי</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+// Phone side of the AC remote. Talks MQTT over a secure WebSocket to the same
+// broker the ESP32 uses: publishes commands to <base>/set and listens to
+// <base>/state (current AC settings) and <base>/status (ESP32 online/offline).
+
+const TOPIC_BASE = 'ac/livingroom';
+const DEFAULT_HOST = 'ie11b7ff.ala.eu-central-1.emqxsl.com';
+const WS_PORT = 8084;           // EMQX secure WebSocket port
+const MIN_TEMP = 16, MAX_TEMP = 30;
+const TEMP_SEND_DELAY_MS = 700; // wait for the user to stop tapping +/-
+const REPLY_TIMEOUT_MS = 6000;
+
+const MODE_NAMES = { cool: 'קירור', heat: 'חימום', dry: 'ייבוש', fan: 'מאוורר', auto: 'אוטומטי' };
+const SOURCE_NAMES = { app: 'מהאפליקציה', remote: 'מהשלט המקורי', serial: 'מהמחשב', boot: 'הלוח עלה' };
+
+const $ = id => document.getElementById(id);
+let client = null;
+let state = null;          // last state reported by the ESP32
+let boardOnline = false;
+let pendingTemp = null;    // temperature shown while the user is still tapping
+let tempTimer = null;
+let replyTimer = null;
+let lastUpdate = null;
+
+// ---------------------------------------------------------------- settings
+
+function loadSettings() {
+  try { return JSON.parse(localStorage.getItem('ac-settings')) || {}; }
+  catch { return {}; }
+}
+
+function saveSettings(s) {
+  try { localStorage.setItem('ac-settings', JSON.stringify(s)); } catch {}
+}
+
+function openSettings() {
+  const s = loadSettings();
+  $('host').value = s.host || DEFAULT_HOST;
+  $('user').value = s.user || 'phone-app';
+  $('pass').value = s.pass || '';
+  $('settings').showModal();
+}
+
+$('open-settings').onclick = openSettings;
+$('settings').addEventListener('close', () => {
+  if ($('settings').returnValue !== 'save') return;
+  saveSettings({ host: $('host').value.trim(), user: $('user').value.trim(), pass: $('pass').value });
+  connect();
+});
+document.querySelectorAll('[data-assume]').forEach(b => b.onclick = () => {
+  send({ assume: b.dataset.assume });
+  $('settings').close();
+});
+
+// ---------------------------------------------------------------- MQTT
+
+function connect() {
+  const s = loadSettings();
+  if (!s.host || !s.user || !s.pass) { openSettings(); return; }
+  if (client) client.end(true);
+
+  setStatus('warn', 'מתחבר…');
+  client = mqtt.connect(`wss://${s.host}:${WS_PORT}/mqtt`, {
+    username: s.user,
+    password: s.pass,
+    clientId: 'phone-' + Math.random().toString(16).slice(2, 10),
+    reconnectPeriod: 3000,
+    connectTimeout: 10000,
+  });
+
+  client.on('connect', () => {
+    // Both topics are retained, so we get the latest values right away.
+    client.subscribe([`${TOPIC_BASE}/state`, `${TOPIC_BASE}/status`], { qos: 1 });
+    render();
+  });
+  client.on('reconnect', () => setStatus('warn', 'מתחבר…'));
+  client.on('offline', () => setStatus('bad', 'אין חיבור'));
+  client.on('error', err => {
+    if (/not authorized|bad user/i.test(err.message)) {
+      setStatus('bad', 'סיסמה שגויה');
+      client.end(true);
+      openSettings();
+    }
+  });
+  client.on('message', (topic, payload) => {
+    const text = payload.toString();
+    if (topic.endsWith('/status')) {
+      boardOnline = text === 'online';
+    } else if (topic.endsWith('/state')) {
+      try { state = JSON.parse(text); } catch { return; }
+      lastUpdate = new Date();
+      clearTimeout(replyTimer);
+    }
+    render();
+  });
+}
+
+function send(command) {
+  if (!client || !client.connected) { toast('אין חיבור לשרת'); return; }
+  client.publish(`${TOPIC_BASE}/set`, JSON.stringify(command), { qos: 1 });
+  // The ESP32 answers every command with a fresh state message.
+  clearTimeout(replyTimer);
+  replyTimer = setTimeout(() => toast('הלוח לא הגיב. בדוק שהוא מחובר לחשמל ול-Wi-Fi'), REPLY_TIMEOUT_MS);
+}
+
+// ---------------------------------------------------------------- controls
+
+$('power').onclick = () => {
+  if (!state) return;
+  send({ power: state.power ? 'off' : 'on' });
+};
+
+function changeTemp(delta) {
+  if (!state) return;
+  const base = pendingTemp ?? state.temp;
+  pendingTemp = Math.min(MAX_TEMP, Math.max(MIN_TEMP, base + delta));
+  render();
+  clearTimeout(tempTimer);
+  tempTimer = setTimeout(() => {
+    send({ temp: pendingTemp });
+    pendingTemp = null;
+  }, TEMP_SEND_DELAY_MS);
+}
+$('temp-up').onclick = () => changeTemp(+1);
+$('temp-down').onclick = () => changeTemp(-1);
+
+document.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => send({ mode: b.dataset.mode }));
+document.querySelectorAll('[data-fan]').forEach(b => b.onclick = () => send({ fan: b.dataset.fan }));
+
+// ---------------------------------------------------------------- view
+
+function setStatus(kind, text) {
+  $('status').className = 'pill ' + kind;
+  $('status-text').textContent = text;
+}
+
+function timeAgo(date) {
+  const sec = Math.round((Date.now() - date) / 1000);
+  if (sec < 10) return 'עכשיו';
+  if (sec < 60) return `לפני ${sec} שניות`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return min === 1 ? 'לפני דקה' : `לפני ${min} דקות`;
+  return date.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+}
+
+function render() {
+  if (client && client.connected) {
+    setStatus(boardOnline ? 'ok' : 'bad', boardOnline ? 'מחובר' : 'הלוח מנותק');
+  }
+
+  const ready = !!state && boardOnline && client && client.connected;
+  document.querySelectorAll('main button').forEach(b => b.disabled = !ready);
+
+  if (!state) return;
+  const temp = pendingTemp ?? state.temp;
+  $('temp').innerHTML = `${temp}<small>°</small>`;
+  $('hero').classList.toggle('off', !state.power);
+  $('power').classList.toggle('is-on', state.power);
+  $('power-text').textContent = state.power ? 'כבה' : 'הדלק';
+  $('state-label').innerHTML = state.power
+    ? `<strong>דלוק</strong> · ${MODE_NAMES[state.mode] || state.mode}`
+    : '<strong>כבוי</strong>';
+
+  document.querySelectorAll('[data-mode]').forEach(b =>
+    b.setAttribute('aria-pressed', b.dataset.mode === state.mode));
+  document.querySelectorAll('[data-fan]').forEach(b =>
+    b.setAttribute('aria-pressed', b.dataset.fan === state.fan));
+
+  if (lastUpdate) {
+    const source = SOURCE_NAMES[state.source] || '';
+    $('meta').textContent = `עודכן ${timeAgo(lastUpdate)}${source ? ' · ' + source : ''}`;
+  }
+}
+
+let toastTimer = null;
+function toast(text) {
+  $('toast').textContent = text;
+  $('toast').classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $('toast').classList.remove('show'), 3500);
+}
+
+setInterval(render, 15000);  // keep "updated X ago" fresh
+// iOS suspends pages in the background; reconnect when the app comes back.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && client && !client.connected) client.reconnect();
+});
+
+connect();
+</script>
+</body>
+</html>
