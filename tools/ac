@@ -6,6 +6,7 @@
 #   ac temp 24           set an exact temperature
 #   ac mode cool         cool | heat | dry | fan | auto
 #   ac status            show what the AC is doing now
+#   ac sync off          tell the ESP32 the AC's real power state (sends no IR)
 #
 # The broker password is read from the macOS Keychain, so it never appears on
 # screen or in shell history. Save it once with:
@@ -20,8 +21,8 @@ TOPIC="ac/livingroom"
 CAFILE="/etc/ssl/cert.pem"   # macOS's built-in list of trusted certificates
 
 case "${1:-status}" in
-  on|off|up|down|temp|mode|status) ;;
-  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  on|off|up|down|temp|mode|status|sync) ;;
+  *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 PASSWORD=$(security find-generic-password -s esp32-ac-mqtt -a "$USER_NAME" -w 2>/dev/null) || {
@@ -71,4 +72,5 @@ case "${1:-status}" in
   temp)   send "{\"temp\":${2:?usage: ac temp 24}}" ;;
   mode)   send "{\"mode\":\"${2:?usage: ac mode cool}\"}" ;;
   status) current_state | pretty ;;
+  sync)   send "{\"assume\":\"${2:?usage: ac sync on|off}\"}" ;;
 esac
