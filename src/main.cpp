@@ -1,43 +1,64 @@
-// AC remote over the internet.
-// The ESP32 joins Wi-Fi, connects to a cloud MQTT broker, and turns messages
-// from the phone into IR commands for the AC. It also listens to the original
-// remote so its idea of the AC's state stays in sync.
+// =============================================================================
+//  AC remote over the internet
+// =============================================================================
 //
-// MQTT topics (TOPIC_BASE = "ac/livingroom"):
-//   <base>/set     phone -> ESP32  JSON, any subset of:
-//                  {"power":"on"|"off"|"toggle", "temp":24,
-//                   "mode":"cool"|"heat"|"dry"|"fan"|"auto",
-//                   "fan":"auto"|"low"|"medium"|"high"}
-//                  or {"assume":"on"|"off"} to fix our power state without sending
-//   <base>/state   ESP32 -> phone  JSON with the full current state (retained)
-//   <base>/status  "online" / "offline" (retained, offline set by the broker
-//                  automatically if the ESP32 disappears)
+//  THE BIG PICTURE
+//  ---------------
+//    Phone app  --(internet)-->  MQTT broker in the cloud  --(internet)-->
+//    this ESP32 at home  --(infrared light)-->  air conditioner
 //
-// Serial debug commands: p = power, + / - = temp, m = mode, s = state,
-//   l = loopback, d = drive strength
+//  The ESP32 is a tiny computer with Wi-Fi. It:
+//    1. joins the home Wi-Fi,
+//    2. connects to a cloud "message board" (an MQTT broker),
+//    3. waits for commands from the phone, like {"power":"on","temp":23},
+//    4. turns each command into the same infrared flashes the AC's remote sends,
+//    5. reports the AC's current state back so the phone can show it.
+//  It also listens to the ORIGINAL remote, so if someone uses it, the app
+//  still shows the right state.
 //
-// Onboard RGB LED: yellow = connecting to Wi-Fi, cyan = Wi-Fi but no MQTT,
-// green = fully connected, blue flash = IR received, purple flash = IR sent.
+//  WHY A BROKER IN THE MIDDLE?
+//  The home router blocks connections coming in from the internet (good for
+//  security). So neither side connects to the other directly: both the phone
+//  and the ESP32 connect OUT to the broker, and the broker passes messages.
+//
+//  MQTT TOPICS (like named mailboxes; TOPIC_BASE = "ac/livingroom")
+//    <base>/set     phone -> ESP32  JSON, any subset of:
+//                   {"power":"on"|"off"|"toggle", "temp":24,
+//                    "mode":"cool"|"heat"|"dry"|"fan"|"auto",
+//                    "fan":"auto"|"low"|"medium"|"high"}
+//                   or {"assume":"on"|"off"} to fix our power state without sending
+//    <base>/state   ESP32 -> phone  JSON with the full current state (retained)
+//    <base>/status  "online" / "offline" (retained, offline set by the broker
+//                   automatically if the ESP32 disappears)
+//
+//  Serial debug commands (type in the serial monitor): p = power,
+//    + / - = temp, m = mode, s = state, l = loopback, d = drive strength
+//
+//  Onboard RGB LED: yellow = connecting to Wi-Fi, cyan = Wi-Fi but no MQTT,
+//  green = fully connected, blue flash = IR received, purple flash = IR sent.
+// =============================================================================
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
-#include <Preferences.h>
-#include <time.h>
-#include <IRrecv.h>
+#include <WiFi.h>              // join the home Wi-Fi
+#include <WiFiClientSecure.h>  // encrypted (TLS) internet connections
+#include <PubSubClient.h>      // MQTT: talk to the cloud broker
+#include <ArduinoJson.h>       // read/write JSON messages like {"temp":23}
+#include <Preferences.h>       // save small values that survive a reboot
+#include <time.h>              // real clock from the internet
+#include <IRrecv.h>            // decode infrared signals from the original remote
 #include <IRsend.h>
 #include <IRac.h>
 #include <IRutils.h>
-#include <ir_Whirlpool.h>
-#include <driver/gpio.h>
-#include "secrets.h"
-#include "root_ca.h"
+#include <ir_Whirlpool.h>      // knows the AC's "language" (Whirlpool protocol)
+#include <driver/gpio.h>       // low-level pin settings (drive strength)
+#include "secrets.h"           // Wi-Fi and broker passwords, NOT on GitHub
+#include "root_ca.h"           // certificate to verify the broker is genuine
+
+// ---------------------------------------------------------------- settings
 
 const uint8_t BRIGHTNESS = 40;  // 0-255; the LED is very bright at full power
-const unsigned long CONNECT_TIMEOUT_MS = 20000;
-const unsigned long MQTT_RETRY_MS = 5000;
+const unsigned long CONNECT_TIMEOUT_MS = 20000;  // give up on Wi-Fi after 20s
+const unsigned long MQTT_RETRY_MS = 5000;        // retry the broker every 5s
 
 // Israel time zone, including daylight saving rules. Used to set the AC clock.
 const char *TIME_ZONE = "IST-2IDT,M3.4.4/26,M10.5.0";
@@ -45,7 +66,8 @@ const char *TIME_ZONE = "IST-2IDT,M3.4.4/26,M10.5.0";
 const char *TOPIC_BASE = "ac/livingroom";
 String topicSet, topicState, topicStatus;
 
-// IR receiver settings.
+// IR RECEIVER: the black 3-leg part. It turns infrared flashes into a clean
+// on/off signal on this pin, so we can "hear" the original remote.
 const uint16_t IR_RECV_PIN = 2;
 // AC remotes send the whole state in one long message, so we need a big
 // buffer (default is 100) and a timeout long enough to keep multi-part
@@ -55,12 +77,20 @@ const uint8_t RECV_TIMEOUT_MS = 50;
 // Ignore short noise bursts (sunlight, lamps) that aren't real remote signals.
 const uint16_t MIN_UNKNOWN_SIZE = 12;
 
-// IR LED. It's wired straight to the pin with no current-limiting resistor,
+// IR LED: the clear LED that "talks" to the AC with invisible light.
+// It's wired straight to the pin with no current-limiting resistor,
 // so we lower the pin's drive strength (~10mA instead of the default ~20mA)
 // to protect both the LED and the ESP32. Range is about a meter.
 const uint16_t IR_SEND_PIN = 3;
 
-// Whirlpool AC timings in microseconds (from IRremoteESP8266's ir_Whirlpool.cpp).
+// HOW THE AC'S LANGUAGE LOOKS (Whirlpool protocol)
+// Every message is a pattern of light flashes ("marks") and pauses ("spaces"),
+// measured in microseconds (millionths of a second):
+//   - a long "attention" flash + pause (the header),
+//   - then 168 bits: each bit is a short flash, followed by
+//     a SHORT pause for a 0 or a LONG pause for a 1.
+// These numbers come from IRremoteESP8266's ir_Whirlpool.cpp and match what
+// we recorded from the real remote.
 const uint16_t WP_HDR_MARK = 8950;
 const uint16_t WP_HDR_SPACE = 4484;
 const uint16_t WP_BIT_MARK = 597;
@@ -71,8 +101,9 @@ const uint16_t WP_GAP = 7920;
 const uint8_t WP_SECTION_SIZES[] = {6, 8, 7};
 
 IRrecv irrecv(IR_RECV_PIN, CAPTURE_BUFFER_SIZE, RECV_TIMEOUT_MS, true);
-// Used only to build and decode the AC state bytes. Sending goes through the
-// RMT hardware instead (see sendIrState), so begin() is never called on it.
+// Holds the AC settings (temp, mode, fan...) and packs them into the 21 bytes
+// the AC understands. Sending goes through the RMT hardware instead
+// (see sendIrState), so begin() is never called on it.
 IRWhirlpoolAc ac(IR_SEND_PIN);
 decode_results results;
 
@@ -80,8 +111,9 @@ WiFiClientSecure tlsClient;  // encrypted connection, so nobody can read or fake
 PubSubClient mqtt(tlsClient);
 Preferences prefs;           // small key-value store in flash that survives reboots
 
-// The remote's power button is a toggle, not absolute on/off, so the
-// ESP32 has to remember whether it thinks the AC is on.
+// The AC's power button is a TOGGLE ("flip on/off"), not separate on and off
+// buttons. So the ESP32 must remember whether it thinks the AC is on,
+// otherwise "turn on" could accidentally turn it off.
 bool acIsOn = false;
 
 // ---------------------------------------------------------------- LED
@@ -90,6 +122,7 @@ void setLed(uint8_t r, uint8_t g, uint8_t b) {
   rgbLedWrite(RGB_BUILTIN, r, g, b);
 }
 
+// Shows the connection status at a glance, without a computer attached.
 void restoreStatusLed() {
   if (WiFi.status() != WL_CONNECTED) setLed(0, 0, 0);
   else if (!mqtt.connected()) setLed(0, BRIGHTNESS, BRIGHTNESS);  // cyan
@@ -99,6 +132,7 @@ void restoreStatusLed() {
 // ---------------------------------------------------------------- names
 
 // Mode and fan codes are numbers inside the IR protocol; the app uses words.
+// These tables translate between the two, e.g. "cool" <-> 2.
 struct Named { const char *name; uint8_t value; };
 const Named MODES[] = {{"cool", kWhirlpoolAcCool}, {"dry", kWhirlpoolAcDry},
                        {"fan", kWhirlpoolAcFan},   {"heat", kWhirlpoolAcHeat},
@@ -108,12 +142,14 @@ const Named FANS[] = {{"auto", kWhirlpoolAcFanAuto}, {"low", kWhirlpoolAcFanLow}
 const size_t MODE_COUNT = sizeof(MODES) / sizeof(MODES[0]);
 const size_t FAN_COUNT = sizeof(FANS) / sizeof(FANS[0]);
 
+// Number -> word (for messages we send to the phone).
 const char *nameOf(const Named *table, size_t count, uint8_t value) {
   for (size_t i = 0; i < count; i++)
     if (table[i].value == value) return table[i].name;
   return "unknown";
 }
 
+// Word -> number (for commands we get from the phone).
 bool valueOf(const Named *table, size_t count, const char *name, uint8_t &value) {
   for (size_t i = 0; i < count; i++) {
     if (strcmp(table[i].name, name) == 0) {
@@ -126,6 +162,8 @@ bool valueOf(const Named *table, size_t count, const char *name, uint8_t &value)
 
 // ---------------------------------------------------------------- state
 
+// Saves the AC settings to flash memory, so a power cut or reboot doesn't
+// make the ESP32 forget that the AC is on.
 void saveState() {
   prefs.putBool("on", acIsOn);
   prefs.putUChar("temp", ac.getTemp());
@@ -133,6 +171,7 @@ void saveState() {
   prefs.putUChar("fan", ac.getFan());
 }
 
+// Reads the saved settings back after a reboot (24C cool is the default).
 void loadState() {
   acIsOn = prefs.getBool("on", false);
   ac.setTemp(prefs.getUChar("temp", 24));
@@ -151,13 +190,14 @@ void publishState(const char *source) {
   printState();
   if (!mqtt.connected()) return;
 
+  // Build a JSON message like {"power":true,"temp":23,"mode":"cool",...}
   JsonDocument doc;
   doc["power"] = acIsOn;
   doc["temp"] = ac.getTemp();
   doc["mode"] = nameOf(MODES, MODE_COUNT, ac.getMode());
   doc["fan"] = nameOf(FANS, FAN_COUNT, ac.getFan());
   doc["source"] = source;
-  doc["rssi"] = WiFi.RSSI();
+  doc["rssi"] = WiFi.RSSI();  // Wi-Fi signal strength, handy for debugging
 
   char payload[256];
   serializeJson(doc, payload);
@@ -168,39 +208,49 @@ void publishState(const char *source) {
 
 // ---------------------------------------------------------------- IR send
 
-// The RMT peripheral generates IR signals in hardware. Toggling the pin from
-// software (what the library does) gets interrupted by Wi-Fi, which garbles
-// bits; RMT plays back a prepared list of timings with exact precision.
+// RMT = "Remote Control Transceiver", a piece of hardware inside the ESP32
+// built for exactly this job. We hand it a list of "on for X us, off for Y us"
+// steps and it plays them back with perfect timing by itself.
+// Why not just switch the pin on/off in code? We tried: the processor also
+// handles Wi-Fi, and every Wi-Fi interruption stretched a flash and garbled
+// a bit, so the AC rejected the message. Hardware timing fixed it.
 void setupIrSender() {
   rmtInit(IR_SEND_PIN, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 1000000);  // 1 tick = 1us
-  // 38kHz carrier at 50% duty, applied during the HIGH (mark) parts.
+  // CARRIER: during every "mark" the LED doesn't just stay on, it blinks
+  // 38,000 times per second. The AC's receiver only reacts to light blinking
+  // at that rate, which is how it ignores sunlight and lamps.
+  // 50% duty = on half of each blink.
   // Note carrier_level = false: with true the carrier ran during the LOW parts,
   // which inverted the whole signal (long marks, short spaces).
   rmtSetCarrier(IR_SEND_PIN, true, false, 38000, 0.5);
+  // Limit the pin's current, since the LED has no resistor (see IR_SEND_PIN).
   gpio_set_drive_capability((gpio_num_t)IR_SEND_PIN, GPIO_DRIVE_CAP_1);
 }
 
-// Encodes the 21 state bytes as Whirlpool IR timings and sends them via RMT.
-// Each RMT symbol is one "LED on for X us, then off for Y us" pair.
+// Turns the 21 bytes of AC settings into light flashes and sends them.
+// Each RMT "symbol" is one pair: LED on for X us, then off for Y us.
 void sendIrState(const uint8_t *state) {
   rmt_data_t symbols[1 + kWhirlpoolAcBits + sizeof(WP_SECTION_SIZES)];
   size_t n = 0;
+  // Small helper: append one "flash, then pause" step to the list.
   auto add = [&](uint16_t mark, uint16_t space) {
     symbols[n++] = {.duration0 = mark, .level0 = 1, .duration1 = space, .level1 = 0};
   };
 
-  add(WP_HDR_MARK, WP_HDR_SPACE);
+  add(WP_HDR_MARK, WP_HDR_SPACE);  // the "attention!" header
   size_t byteIndex = 0;
   for (uint8_t section = 0; section < sizeof(WP_SECTION_SIZES); section++) {
     for (uint8_t i = 0; i < WP_SECTION_SIZES[section]; i++, byteIndex++) {
       for (uint8_t bit = 0; bit < 8; bit++) {  // least significant bit first
         bool one = state[byteIndex] & (1 << bit);
+        // Every bit starts with the same short flash; the pause length
+        // after it is what tells the AC whether it's a 1 or a 0.
         add(WP_BIT_MARK, one ? WP_ONE_SPACE : WP_ZERO_SPACE);
       }
     }
     add(WP_BIT_MARK, WP_GAP);  // section footer
   }
-  rmtWrite(IR_SEND_PIN, symbols, n, 1000);
+  rmtWrite(IR_SEND_PIN, symbols, n, 1000);  // send it all (wait up to 1s)
 }
 
 // Keeps the AC's own clock correct, the way the original remote does.
@@ -209,7 +259,9 @@ void updateAcClock() {
   if (getLocalTime(&now, 0)) ac.setClock(now.tm_hour * 60 + now.tm_min);
 }
 
-// Sends the current state with the given button "command" code.
+// Sends the current settings to the AC.
+// `command` says which "button" was pressed (power, temp, mode...). The AC
+// uses it to know what changed, e.g. to beep or show the new temperature.
 void sendToAc(uint8_t command) {
   updateAcClock();
   ac.setCommand(command);
@@ -217,7 +269,7 @@ void sendToAc(uint8_t command) {
   // press, so stop listening while we transmit.
   irrecv.disableIRIn();
   setLed(BRIGHTNESS, 0, BRIGHTNESS);  // purple
-  sendIrState(ac.getRaw());
+  sendIrState(ac.getRaw());  // getRaw() also calculates the checksum bytes
   ac.setPowerToggle(false);  // toggle is a one-shot flag, never leave it set
   ac.setCommand(command);    // setPowerToggle() overwrites the command; restore it
   delay(100);
@@ -225,6 +277,7 @@ void sendToAc(uint8_t command) {
   restoreStatusLed();
 }
 
+// Presses the power button (on <-> off) and remembers the new state.
 void togglePower() {
   ac.setPowerToggle(true);
   acIsOn = !acIsOn;
@@ -234,9 +287,9 @@ void togglePower() {
 
 // ---------------------------------------------------------------- commands from the app
 
-// Applies a JSON command from the phone. One IR message always carries the
-// whole state, so even if several settings change we send only once, tagged
-// with the most important "button" that changed.
+// Runs a command that arrived from the phone, e.g. {"power":"on","temp":23}.
+// One IR message always carries the WHOLE state, so even if several settings
+// change we send only once, tagged with the most important "button" that changed.
 void handleSetCommand(const char *json) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) {
@@ -254,6 +307,8 @@ void handleSetCommand(const char *json) {
     return;
   }
 
+  // Power is a toggle, so "on" only presses the button if the AC is off,
+  // and "off" only if it's on.
   bool wantPowerChange = false;
   if (doc["power"].is<const char *>()) {
     const char *p = doc["power"];
@@ -262,6 +317,7 @@ void handleSetCommand(const char *json) {
     else if (strcmp(p, "off") == 0) wantPowerChange = acIsOn;
   }
 
+  // Apply any new fan / temperature / mode to our settings.
   int command = -1;
   uint8_t value;
   if (doc["fan"].is<const char *>() && valueOf(FANS, FAN_COUNT, doc["fan"], value) &&
@@ -291,7 +347,9 @@ void handleSetCommand(const char *json) {
   publishState("app");
 }
 
+// Called automatically by the MQTT library whenever a message arrives.
 void onMqttMessage(char *topic, byte *payload, unsigned int length) {
+  // The payload isn't a C string yet: copy it and add the end marker '\0'.
   char json[256];
   length = min(length, (unsigned int)sizeof(json) - 1);
   memcpy(json, payload, length);
@@ -302,16 +360,18 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
 
 // ---------------------------------------------------------------- IR receive
 
-// A press on the original remote: adopt its settings so we stay in sync.
+// Someone pressed the ORIGINAL remote: copy its settings so we stay in sync,
+// and tell the phone, so the app shows the change too.
 void handleRemotePress() {
   setLed(0, 0, BRIGHTNESS);  // blue flash
   if (results.decode_type == WHIRLPOOL_AC) {
-    ac.setRaw(results.state);
-    if (ac.getPowerToggle()) acIsOn = !acIsOn;
+    ac.setRaw(results.state);                  // take all settings from the remote
+    if (ac.getPowerToggle()) acIsOn = !acIsOn; // the power button was pressed
     ac.setPowerToggle(false);
     Serial.print("<< Original remote: ");
     publishState("remote");
   } else {
+    // Some other remote, like a TV. Just log it.
     Serial.print("<< Other IR signal: ");
     Serial.print(resultToHumanReadableBasic(&results));
   }
@@ -320,6 +380,7 @@ void handleRemotePress() {
 }
 
 // ---------------------------------------------------------------- diagnostics
+// Tools we used while building and debugging. Triggered from the serial monitor.
 
 // Sends a real AC command while the receiver keeps listening. If the IR LED
 // points at the receiver and the receiver decodes it, the LED works.
@@ -354,7 +415,7 @@ void loopbackTest() {
 }
 
 // Steps the IR pin's drive strength up (1 -> 2 -> 3 -> 1) for testing.
-// Roughly: 1 = ~10mA, 2 = ~20mA, 3 = ~40mA.
+// Roughly: 1 = ~10mA, 2 = ~20mA, 3 = ~40mA. More current = longer range.
 void cycleDriveStrength() {
   gpio_drive_cap_t cap;
   gpio_get_drive_capability((gpio_num_t)IR_SEND_PIN, &cap);
@@ -369,6 +430,7 @@ void changeTemp(int delta) {
   sendToAc(kWhirlpoolAcCommandTemp);
 }
 
+// Cycles to the next mode: cool -> dry -> fan -> heat -> auto -> cool...
 void nextMode() {
   size_t i = 0;
   while (i < MODE_COUNT && MODES[i].value != ac.getMode()) i++;
@@ -377,6 +439,7 @@ void nextMode() {
   sendToAc(kWhirlpoolAcCommandMode);
 }
 
+// Single-key commands typed in the serial monitor (USB cable to a computer).
 void handleSerialCommand(char c) {
   switch (c) {
     case 'p': togglePower(); publishState("serial"); break;
@@ -395,6 +458,7 @@ void handleSerialCommand(char c) {
 
 // ---------------------------------------------------------------- connections
 
+// Joins the home Wi-Fi. Waits up to 20 seconds, printing dots meanwhile.
 bool connectWifi() {
   setLed(BRIGHTNESS, BRIGHTNESS / 2, 0);  // yellow
   Serial.printf("Connecting to \"%s\"", WIFI_SSID);
@@ -419,11 +483,12 @@ bool connectWifi() {
   return true;
 }
 
+// Logs in to the cloud broker and starts listening for commands.
 bool connectMqtt() {
   Serial.printf("Connecting to MQTT broker %s:%d... ", MQTT_HOST, MQTT_PORT);
   // Last Will: if we vanish without saying goodbye (power cut, crash), the
   // broker publishes "offline" for us, so the app knows the ESP32 is down.
-  String clientId = "esp32-ac-" + WiFi.macAddress();
+  String clientId = "esp32-ac-" + WiFi.macAddress();  // unique name per board
   if (!mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD,
                     topicStatus.c_str(), 1, true, "offline")) {
     Serial.printf("failed (state %d)\n", mqtt.state());
@@ -431,17 +496,20 @@ bool connectMqtt() {
     return false;
   }
   Serial.println("connected!");
-  mqtt.publish(topicStatus.c_str(), "online", true);
-  mqtt.subscribe(topicSet.c_str(), 1);
+  mqtt.publish(topicStatus.c_str(), "online", true);  // "I'm here!"
+  mqtt.subscribe(topicSet.c_str(), 1);  // "send me every message on /set"
   restoreStatusLed();
   publishState("boot");
   return true;
 }
 
 // ---------------------------------------------------------------- main
+// Every Arduino program has two functions:
+//   setup() runs ONCE when the board powers on,
+//   loop()  runs AGAIN AND AGAIN forever after that.
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);  // text output to the computer, for debugging
   delay(500);
 
   topicSet = String(TOPIC_BASE) + "/set";
@@ -461,18 +529,19 @@ void setup() {
   // and the AC remote protocol includes the time of day.
   configTzTime(TIME_ZONE, "pool.ntp.org", "time.google.com");
 
+  // Only trust a broker whose certificate is signed by this root authority.
   tlsClient.setCACert(ROOT_CA);
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(onMqttMessage);
+  mqtt.setCallback(onMqttMessage);  // "call this function when a message arrives"
   mqtt.setBufferSize(512);
 
   setupIrSender();
-  ac.setModel(DG11J191);
+  ac.setModel(DG11J191);  // the exact remote model we recorded
   ac.setLight(true);
   loadState();  // restore what we knew before the last reboot
 
   irrecv.setUnknownThreshold(MIN_UNKNOWN_SIZE);
-  irrecv.enableIRIn();
+  irrecv.enableIRIn();  // start listening to the original remote
 
   Serial.println("Ready. Commands: p = power, + / - = temp, m = mode, s = state, "
                  "l = loopback, d = drive strength");
@@ -480,16 +549,18 @@ void setup() {
 }
 
 void loop() {
+  // 1. Did the original remote send something?
   if (irrecv.decode(&results)) {
     handleRemotePress();
     irrecv.resume();  // get ready for the next signal
   }
 
+  // 2. Did someone type a command in the serial monitor?
   while (Serial.available()) {
     handleSerialCommand(Serial.read());
   }
 
-  // Reconnect automatically if the router or the broker drops us.
+  // 3. Still on Wi-Fi? Reconnect automatically if the router dropped us.
   static unsigned long lastWifiCheck = 0;
   if (millis() - lastWifiCheck > 5000) {
     lastWifiCheck = millis();
@@ -500,6 +571,7 @@ void loop() {
     }
   }
 
+  // 4. Stay connected to the broker and handle incoming phone commands.
   // Skip MQTT until secrets.h has a real broker, so IR testing isn't slowed
   // down by connection attempts that can't succeed.
   static const bool mqttConfigured = strstr(MQTT_HOST, "your-cluster") == nullptr;

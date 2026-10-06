@@ -225,9 +225,18 @@
 </dialog>
 
 <script>
-// Phone side of the AC remote. Talks MQTT over a secure WebSocket to the same
-// broker the ESP32 uses: publishes commands to <base>/set and listens to
-// <base>/state (current AC settings) and <base>/status (ESP32 online/offline).
+// =============================================================================
+//  Phone side of the AC remote
+// =============================================================================
+//  This page is the "remote control" on the phone. It never talks to the
+//  ESP32 directly. Instead it connects to the same cloud MQTT broker:
+//    - it PUBLISHES commands to   ac/livingroom/set     e.g. {"power":"on"}
+//    - it SUBSCRIBES (listens) to ac/livingroom/state   the AC's current settings
+//                             and ac/livingroom/status  is the ESP32 online?
+//  Browsers can't open raw MQTT connections, so MQTT runs inside a secure
+//  WebSocket (wss://), a standard way for web pages to keep a live connection.
+//  The mqtt.js library (loaded at the top of the page) handles all of that.
+// =============================================================================
 
 const TOPIC_BASE = 'ac/livingroom';
 const DEFAULT_HOST = 'ie11b7ff.ala.eu-central-1.emqxsl.com';
@@ -249,6 +258,9 @@ let replyTimer = null;
 let lastUpdate = null;
 
 // ---------------------------------------------------------------- settings
+// The broker password is NOT in this file (the code is public on GitHub).
+// It's typed once in the settings screen and saved only on this phone,
+// in the browser's localStorage.
 
 function loadSettings() {
   try { return JSON.parse(localStorage.getItem('ac-settings')) || {}; }
@@ -280,6 +292,8 @@ document.querySelectorAll('[data-assume]').forEach(b => b.onclick = () => {
 
 // ---------------------------------------------------------------- MQTT
 
+// Opens the live connection to the broker and wires up what happens on
+// connect, disconnect and every incoming message.
 function connect() {
   const s = loadSettings();
   if (!s.host || !s.user || !s.pass) { openSettings(); return; }
@@ -308,6 +322,8 @@ function connect() {
       openSettings();
     }
   });
+  // Runs every time the ESP32 reports something. This is how the screen
+  // updates live, even when the change came from the original remote.
   client.on('message', (topic, payload) => {
     const text = payload.toString();
     if (topic.endsWith('/status')) {
@@ -321,6 +337,8 @@ function connect() {
   });
 }
 
+// Sends a command to the ESP32 through the broker.
+// qos: 1 = "at least once": the broker confirms it got the message.
 function send(command) {
   if (!client || !client.connected) { toast('אין חיבור לשרת'); return; }
   client.publish(`${TOPIC_BASE}/set`, JSON.stringify(command), { qos: 1 });
@@ -331,11 +349,15 @@ function send(command) {
 
 // ---------------------------------------------------------------- controls
 
+// We send "on" or "off" (not "toggle"), so a double tap can't flip it back.
 $('power').onclick = () => {
   if (!state) return;
   send({ power: state.power ? 'off' : 'on' });
 };
 
+// Tapping + three times quickly sends ONE command (+3) instead of three:
+// the number updates on screen right away, and we only send after the
+// user stops tapping for 0.7 seconds ("debouncing").
 function changeTemp(delta) {
   if (!state) return;
   const base = pendingTemp ?? state.temp;
@@ -369,6 +391,8 @@ function timeAgo(date) {
   return date.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
 }
 
+// Redraws the screen from the latest state the ESP32 reported.
+// Buttons are disabled while the ESP32 is offline, so nothing gets lost.
 function render() {
   if (client && client.connected) {
     setStatus(boardOnline ? 'ok' : 'bad', boardOnline ? 'מחובר' : 'הלוח מנותק');
