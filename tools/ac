@@ -1,0 +1,74 @@
+#!/bin/bash
+# Control the AC from the terminal, through the same cloud broker as the app.
+#
+#   ac on | off          turn the AC on or off
+#   ac up | down         one degree warmer / cooler
+#   ac temp 24           set an exact temperature
+#   ac mode cool         cool | heat | dry | fan | auto
+#   ac status            show what the AC is doing now
+#
+# The broker password is read from the macOS Keychain, so it never appears on
+# screen or in shell history. Save it once with:
+#   security add-generic-password -s esp32-ac-mqtt -a phone-app -w
+
+set -euo pipefail
+
+HOST="ie11b7ff.ala.eu-central-1.emqxsl.com"
+PORT=8883
+USER_NAME="phone-app"
+TOPIC="ac/livingroom"
+CAFILE="/etc/ssl/cert.pem"   # macOS's built-in list of trusted certificates
+
+case "${1:-status}" in
+  on|off|up|down|temp|mode|status) ;;
+  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+PASSWORD=$(security find-generic-password -s esp32-ac-mqtt -a "$USER_NAME" -w 2>/dev/null) || {
+  echo "No password in the Keychain yet. Save it once with:"
+  echo "  security add-generic-password -s esp32-ac-mqtt -a $USER_NAME -w"
+  exit 1
+}
+MQTT=(-h "$HOST" -p "$PORT" --cafile "$CAFILE" -u "$USER_NAME" -P "$PASSWORD")
+
+# Turns the ESP32's JSON report into one friendly line.
+pretty() {
+  jq -r '"\(if .power then "❄️  AC is ON " else "💤 AC is OFF" end) · \(.temp)°C · \(.mode) · fan \(.fan)"'
+}
+
+# The broker keeps the last state ("retained"), so this returns instantly.
+current_state() {
+  mosquitto_sub "${MQTT[@]}" -t "$TOPIC/state" -C 1 -W 5
+}
+
+# Publishes a command, then waits for the ESP32's fresh state as proof
+# that it really received and executed it.
+send() {
+  local reply
+  reply=$(mktemp)
+  # Start listening BEFORE sending, so we can't miss the answer.
+  # -R skips the old retained state; we only want the new one.
+  mosquitto_sub "${MQTT[@]}" -t "$TOPIC/state" -R -C 1 -W 8 > "$reply" &
+  local listener=$!
+  sleep 0.7
+  echo "📤 $1"
+  mosquitto_pub "${MQTT[@]}" -t "$TOPIC/set" -q 1 -m "$1"
+  if wait "$listener" && [ -s "$reply" ]; then
+    echo "📥 $(pretty < "$reply")"
+  else
+    echo "⚠️  No reply from the ESP32. Is it powered and online?"
+  fi
+  rm -f "$reply"
+}
+
+case "${1:-status}" in
+  on)     send '{"power":"on"}' ;;
+  off)    send '{"power":"off"}' ;;
+  up|down)
+    temp=$(current_state | jq '.temp')
+    [ "$1" = up ] && temp=$((temp + 1)) || temp=$((temp - 1))
+    send "{\"temp\":$temp}" ;;
+  temp)   send "{\"temp\":${2:?usage: ac temp 24}}" ;;
+  mode)   send "{\"mode\":\"${2:?usage: ac mode cool}\"}" ;;
+  status) current_state | pretty ;;
+esac
