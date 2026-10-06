@@ -21,7 +21,7 @@ CAFILE="/etc/ssl/cert.pem"   # macOS's built-in list of trusted certificates
 
 case "${1:-status}" in
   on|off|up|down|temp|mode|status) ;;
-  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 PASSWORD=$(security find-generic-password -s esp32-ac-mqtt -a "$USER_NAME" -w 2>/dev/null) || {
